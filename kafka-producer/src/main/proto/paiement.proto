@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package com.kafka.injector.proto.paiement;
+
+option java_package = "com.kafka.injector.proto.paiement";
+
+option java_outer_classname = "PaiementProto";
+
+message Paiement {
+  string transaction_id = 1;
+  double montant = 2;
+  MethodePaiement methode = 3;
+  string commande_id = 4;
+  int64 timestamp = 5;
+}
+
+enum MethodePaiement {
+  CARTE = 0;
+  VIREMENT = 1;
+  PAYPAL = 2;
+  CRYPTO = 3;
+}
+

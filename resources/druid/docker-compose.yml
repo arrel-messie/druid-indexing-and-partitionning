@@ -1,0 +1,319 @@
+# Volumes et réseaux sont définis dans le fichier principal (../docker-compose.yml)
+# Ce fichier peut être utilisé seul ou combiné avec le fichier principal
+volumes:
+  metadata_data: {}
+  middle_var: {}
+  historical_var: {}
+  broker_var: {}
+  coordinator_var: {}
+  router_var: {}
+  druid_shared: {}
+  kafka-data: {}
+
+networks:
+  druid_network:
+    name: druid_network
+  resource_network:
+    external: true
+    name: resource-network
+
+services:
+  postgres:
+    container_name: postgres
+    image: postgres:15-alpine
+    ports:
+      - "${POSTGRES_DRUID_PORT:-5432}:5432"
+    volumes:
+      - metadata_data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_PASSWORD=${POSTGRES_DRUID_PASSWORD}
+      - POSTGRES_USER=${POSTGRES_DRUID_USER}
+      - POSTGRES_DB=${POSTGRES_DRUID_DB}
+    networks:
+      - druid_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_DRUID_USER} -d ${POSTGRES_DRUID_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Need 3.5 or later for container nodes
+  zookeeper:
+    container_name: zookeeper
+    image: zookeeper:3.5.10
+    ports:
+      - "2181:2181"
+    environment:
+      - ZOO_MY_ID=${ZOO_MY_ID:-1}
+    networks:
+      - druid_network
+    healthcheck:
+      test: ["CMD-SHELL", "zkServer.sh status || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  coordinator:
+    image: apache/druid:30.0.0
+    container_name: coordinator
+    volumes:
+      - druid_shared:/opt/shared
+      - coordinator_var:/opt/druid/var
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    command:
+      - coordinator
+    environment:
+      - druid_zk_service_host=zookeeper
+      - DRUID_EXTENSIONS_LOADLIST=["druid-histogram", "druid-datasketches", "druid-lookups-cached-global", "postgresql-metadata-storage", "druid-multi-stage-query", "druid-kafka-indexing-service", "druid-protobuf-extensions"]
+    env_file:
+      - .env
+    networks:
+      - druid_network
+      - resource_network
+    restart: unless-stopped
+
+  broker:
+    image: apache/druid:30.0.0
+    container_name: broker
+    volumes:
+      - broker_var:/opt/druid/var
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      coordinator:
+        condition: service_started
+    ports:
+      - "8082:8082"
+    command:
+      - broker
+    environment:
+      - druid_zk_service_host=zookeeper
+      - DRUID_EXTENSIONS_LOADLIST=["druid-histogram", "druid-datasketches", "druid-lookups-cached-global", "postgresql-metadata-storage", "druid-multi-stage-query", "druid-kafka-indexing-service", "druid-protobuf-extensions"]
+    env_file:
+      - .env
+    networks:
+      - druid_network
+      - resource_network
+    restart: unless-stopped
+
+  historical:
+    image: apache/druid:30.0.0
+    container_name: historical
+    volumes:
+      - druid_shared:/opt/shared
+      - historical_var:/opt/druid/var
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      coordinator:
+        condition: service_started
+    ports:
+      - "8083:8083"
+    command:
+      - historical
+    environment:
+      - druid_zk_service_host=zookeeper
+      - DRUID_EXTENSIONS_LOADLIST=["druid-histogram", "druid-datasketches", "druid-lookups-cached-global", "postgresql-metadata-storage", "druid-multi-stage-query", "druid-kafka-indexing-service", "druid-protobuf-extensions"]
+    env_file:
+      - .env
+    networks:
+      - druid_network
+      - resource_network
+    restart: unless-stopped
+
+  middlemanager:
+    image: apache/druid:30.0.0
+    container_name: middlemanager
+    volumes:
+      - druid_shared:/opt/shared
+      - middle_var:/opt/druid/var
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      coordinator:
+        condition: service_started
+    ports:
+      - "8091:8091"
+      - "8100-8105:8100-8105"
+    command:
+      - middleManager
+    environment:
+      - druid_zk_service_host=zookeeper
+      - DRUID_EXTENSIONS_LOADLIST=["druid-histogram", "druid-datasketches", "druid-lookups-cached-global", "postgresql-metadata-storage", "druid-multi-stage-query", "druid-kafka-indexing-service", "druid-protobuf-extensions"]
+    env_file:
+      - .env
+    networks:
+      - druid_network
+      - resource_network
+    restart: unless-stopped
+
+  router:
+    image: apache/druid:30.0.0
+    container_name: router
+    volumes:
+      - router_var:/opt/druid/var
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      coordinator:
+        condition: service_started
+    ports:
+      - "8888:8888"
+    command:
+      - router
+    environment:
+      - druid_zk_service_host=zookeeper
+    env_file:
+      - .env
+    networks:
+      - druid_network
+      - resource_network
+    restart: unless-stopped
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    hostname: kafka
+    container_name: kafka
+    ports:
+      - "9092:9092"
+    environment:
+      # Mode avec Zookeeper (plus stable)
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT_INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      # Configuration pour le développement
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+      KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: 300000
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    networks:
+      - druid_network
+      - resource_network
+    healthcheck:
+      test: [ "CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 || exit 1" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.5.0
+    hostname: schema-registry
+    container_name: schema-registry
+    depends_on:
+      kafka:
+        condition: service_healthy
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "8085:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC: _schemas
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR: 1
+    networks:
+      - druid_network
+      - resource_network
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -f http://localhost:8081/subjects || exit 1" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  akhq:
+    image: tchiotludo/akhq:latest
+    container_name: akhq
+    hostname: akhq
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+    ports:
+      - "8084:8080"
+    environment:
+      AKHQ_CONFIGURATION: |
+        akhq:
+          connections:
+            docker-kafka:
+              properties:
+                bootstrap.servers: "kafka:29092"
+              schema-registry:
+                url: "http://schema-registry:8081"
+                type: "confluent"
+          server:
+            access-log:
+              enabled: false
+          micronaut:
+            security:
+              token:
+                jwt:
+                  signatures:
+                    secret:
+                      generator:
+                        secret: "akhq-secret-key-change-in-production-min-256-bits"
+          ui:
+            topic:
+              default-view: ALL
+              skip-consumer-groups: false
+              skip-last-record: false
+          # Sécurité désactivée pour le développement - permet l'accès sans authentification
+          # security:
+          #   default-group: admin
+          #   groups:
+          #     admin:
+          #       roles:
+          #         - topic/read
+          #         - topic/create
+          #         - topic/insert
+          #         - topic/delete
+          #         - topic/config/update
+          #         - topic/data/read
+          #         - topic/data/insert
+          #         - topic/data/delete
+          #         - group/read
+          #         - group/delete
+          #         - group/offsets/update
+          #   basic-auth:
+          #     - user: admin
+          #       password: admin
+          #       groups:
+          #         - admin
+    networks:
+      - resource_network
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -f http://localhost:8080/api/cluster || exit 1" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
