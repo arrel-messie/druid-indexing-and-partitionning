@@ -1,0 +1,97 @@
+{
+  "type": "kafka",
+  "spec": {
+    "ioConfig": {
+      "type": "kafka",
+      "consumerProperties": {
+        "bootstrap.servers": "kafka:29092"
+      },
+      "topic": "Transactions",
+      "inputFormat": {
+        "type": "protobuf",
+        "protoBytesDecoder": {
+          "type": "file",
+          "descriptor": "syntax = \"proto3\";\n\npackage com.kafka.injector.proto.paiement;\n\noption java_package = \"com.kafka.injector.proto.paiement\";\noption java_outer_classname = \"PaiementProto\";\n\nmessage Paiement {\n  string transaction_id = 1;\n  double montant = 2;\n  MethodePaiement methode = 3;\n  string commande_id = 4;\n  int64 timestamp = 5;\n}\n\nenum MethodePaiement {\n  CARTE = 0;\n  VIREMENT = 1;\n  PAYPAL = 2;\n  CRYPTO = 3;\n}\n",
+          "protoMessageType": "com.kafka.injector.proto.paiement.Paiement"
+        }
+      },
+      "useEarliestOffset": false,
+      "consumerGroupId": "druid-transactions-consumer",
+      "replicas": 1,
+      "taskCount": 1,
+      "taskDuration": "PT1H",
+      "completionTimeout": "PT30M",
+      "lateMessageRejectionPeriod": "PT1H"
+    },
+    "tuningConfig": {
+      "type": "kafka",
+      "maxRowsInMemory": 100000,
+      "maxBytesInMemory": 0,
+      "maxRowsPerSegment": 5000000,
+      "partitionsSpec": {
+        "type": "dynamic"
+      },
+      "indexSpec": {
+        "bitmap": {
+          "type": "roaring"
+        },
+        "dimensionCompression": "lz4",
+        "metricCompression": "lz4",
+        "longEncoding": "longs"
+      },
+      "maxPendingPersists": 0,
+      "reportParseExceptions": false,
+      "handoffConditionTimeout": 0,
+      "resetOffsetAutomatically": false,
+      "intermediateHandoffPeriod": "PT10M",
+      "logParseExceptions": false,
+      "maxParseExceptions": 0,
+      "maxSavedParseExceptions": 0
+    },
+    "dataSchema": {
+      "dataSource": "Transactions",
+      "timestampSpec": {
+        "column": "timestamp",
+        "format": "millis"
+      },
+      "dimensionsSpec": {
+        "dimensions": [
+          {
+            "type": "string",
+            "name": "transaction_id"
+          },
+          {
+            "type": "string",
+            "name": "methode"
+          },
+          {
+            "type": "string",
+            "name": "commande_id"
+          }
+        ]
+      },
+      "metricsSpec": [
+        {
+          "type": "doubleSum",
+          "name": "montant",
+          "fieldName": "montant"
+        },
+        {
+          "type": "count",
+          "name": "count"
+        }
+      ],
+      "granularitySpec": {
+        "type": "uniform",
+        "segmentGranularity": "HOUR",
+        "queryGranularity": "MINUTE",
+        "rollup": true,
+        "intervals": null
+      },
+      "transformSpec": {
+        "transforms": []
+      }
+    }
+  }
+}
+

@@ -1,0 +1,63 @@
+{
+  "type": "kafka",
+  "spec": {
+    "ioConfig": {
+      "type": "kafka",
+      "consumerProperties": {
+        "bootstrap.servers": "kafka:29092"
+      },
+      "topic": "TransactionsJSON",
+      "inputFormat": {
+        "type": "json"
+      },
+      "useEarliestOffset": true,
+      "consumerGroupId": "druid-transactions-json-consumer",
+      "replicas": 1,
+      "taskCount": 1,
+      "taskDuration": "PT1H"
+    },
+    "tuningConfig": {
+      "type": "kafka",
+      "maxRowsInMemory": 100000,
+      "maxRowsPerSegment": 5000000,
+      "partitionsSpec": {
+        "type": "dynamic"
+      }
+    },
+    "dataSchema": {
+      "dataSource": "TransactionsJSON",
+      "timestampSpec": {
+        "column": "timestamp",
+        "format": "millis"
+      },
+      "dimensionsSpec": {
+        "dimensions": [
+          "transaction_id",
+          "methode",
+          "commande_id"
+        ],
+        "dimensionExclusions": []
+      },
+      "metricsSpec": [
+        {
+          "type": "doubleSum",
+          "name": "montant",
+          "fieldName": "montant"
+        },
+        {
+          "type": "count",
+          "name": "count"
+        }
+      ],
+      "granularitySpec": {
+        "type": "uniform",
+        "segmentGranularity": "HOUR",
+        "queryGranularity": "MINUTE",
+        "rollup": true
+      }
+    }
+  }
+}
+
+
+

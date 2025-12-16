@@ -1,9 +1,9 @@
 # Druid Partitioning Strategy Design Document
 ## Transactions Datasource
 
-**Document Version:** 1.0  
+**Document Version:** 3.0  
 **Date:** December 10, 2025  
-**Author:**  
+**Author:** zakaria.kimbembe.external@banque-france.fr  
 **Status:** Draft - Pending Validation
 
 ---
@@ -13,21 +13,109 @@
 ```
 DECISION SUMMARY
 ─────────────────────────────────────────────────────
-Segment Granularity    : DAY
-Query Granularity      : MINUTE
-Partitioning Strategy  : HASH on account_id (assumed)
-Target Segment Size    : 500 MB (~1M rows)
-Daily Segments (avg)   : ~138 partitions
-Daily Segments (peak)  : ~1,382 partitions
-Storage (10-year)      : 170 TB compressed, 258 TB raw
-Compaction Strategy    : Tiered (6h/daily/weekly/monthly)
+Focus Area              : Performance (7-day hot data)
+Segment Granularity     : DAY (to be validated)
+Query Granularity       : MINUTE
+Partitioning Approach   : Sequential Testing (Dynamic → Hash → Single_dim)
+Target Segment Size     : 500 MB - 1 GB (~1M-2M rows)
 
 KEY ASSUMPTIONS (REQUIRE VALIDATION)
 • Transaction volume: 1,600 tx/sec avg, 16,000 tx/sec peak
-• Partition dimension: account_id (high cardinality expected)
-• Query pattern: 80% filter by account, 60% by type
-• Compression ratio: 3:1 (standard for transaction data)
+• Hot data window: 7 days (performance-critical)
+• Dimensions: account_id (320M), country (22), currency (1), PSP_id, access_manager_id
+• Query pattern: Synchronous reporting queries (to be validated)
 ```
+
+---
+
+## Executive Summary (User Story Acceptance Criteria)
+
+This section directly addresses the user story acceptance criteria:
+
+### ✅ 1. Time Granularity Selection and Justification
+
+**`segmentGranularity`: DAY**
+- **Justification**: 
+  - Aligns with daily data collection pattern (138M transactions/day avg, 1.38B peak)
+  - 7 segments for 7-day hot data window (manageable metadata overhead)
+  - Each daily segment (~70.8 GB avg, 707.8 GB peak) can be split into partitions
+  - Most queries target daily or multi-day ranges
+- **Alternative considered**: HOUR (168 segments for 7 days - too many to manage)
+
+**`queryGranularity`: MINUTE**
+- **Justification**:
+  - Fine enough for reporting needs
+  - Allows aggregation to hour/day as needed
+  - Storage impact acceptable (~470 MB/min at peak after compression)
+
+### ✅ 2. Secondary Partitioning Strategy
+
+**Recommended Approach**: Sequential testing of partitioning types:
+
+1. **Baseline**: `dynamic` partitioning (automatic based on size)
+2. **Option A**: `hash` partitioning on `account_id` (if cardinality >100K confirmed)
+   - Even distribution across partitions
+   - Benefits queries filtering by account_id
+3. **Option B**: `single_dim` partitioning on `country` (22 values)
+   - Good for low-cardinality, frequently-filtered dimension
+   - Automatic range optimization by Druid
+
+**Decision**: Performance testing will determine optimal strategy (see Performance Scenarios section).
+
+### ✅ 3. Sizing Note
+
+**Target Segment Size:**
+- **Rows per segment**: 1M-2M rows (~500 MB - 1 GB)
+- **Rationale**: Proven sweet spot in Druid balancing I/O efficiency with metadata overhead
+
+**Daily Segment Breakdown:**
+- Average day: 138M rows → ~138 partitions at 1M rows each
+- Peak day: 1,382M rows → ~1,382 partitions at 1M rows each
+
+**Compaction Strategy:**
+- Consolidate small segments to target size (1M rows, ~500 MB)
+- Maintain or optimize partitioning strategy during compaction
+- Skip last 6 hours to avoid conflicts with active ingestion
+- See [Compaction Strategy](#compaction-strategy) section for full details
+
+### ✅ 4. Primary Filter Dimensions (Ordered)
+
+**Dimension List (ordered by filter frequency and cardinality):**
+
+1. **`account_id`** (~320M cardinality) - **PRIMARY FILTER**
+   - Highest cardinality, expected in ~80% of queries
+   - Best candidate for hash partitioning
+
+2. **`PSP_id`** (cardinality TBD) - **PRIMARY FILTER**
+   - Expected in ~60% of queries (to be validated)
+   - Candidate for hash partitioning if high cardinality
+
+3. **`access_manager_id`** (cardinality TBD) - **PRIMARY FILTER**
+   - Expected in queries (frequency TBD)
+   - Candidate for hash partitioning if high cardinality
+
+4. **`country`** (22 cardinality) - **PRIMARY FILTER**
+   - Expected in ~30% of queries
+   - Best candidate for single_dim partitioning
+
+5. **`transaction_id`** (unique) - Secondary
+   - Guaranteed unique, but query pattern unknown
+
+6. **`currency`** (1 value) - Not useful for partitioning
+
+**Note**: Filter frequencies are assumptions requiring validation from 30 days of query logs.
+
+### ✅ 5. Design Review and Approval
+
+**Review Status**: Draft - Pending Validation
+
+**Required Actions Before Approval:**
+- [ ] Validate dimension cardinalities from production sample
+- [ ] Analyze 30 days of query logs to confirm filter frequencies
+- [ ] Execute performance testing scenarios
+- [ ] Data Architecture review and sign-off
+
+**Approval Section**: See [Validation Plan](#validation-plan) for review workflow.
 
 ---
 
@@ -37,12 +125,9 @@ KEY ASSUMPTIONS (REQUIRE VALIDATION)
 2. [Data Characteristics](#data-characteristics)
 3. [Partitioning Strategy](#partitioning-strategy)
 4. [Dimension Design](#dimension-design)
-5. [Capacity Planning](#capacity-planning)
+5. [Performance Scenarios](#performance-scenarios)
 6. [Compaction Strategy](#compaction-strategy)
-7. [Performance Considerations](#performance-considerations)
-8. [Risk Analysis](#risk-analysis)
-9. [Validation Plan](#validation-plan)
-10. [Approval](#approval)
+7. [Validation Plan](#validation-plan)
 
 ---
 
@@ -50,103 +135,197 @@ KEY ASSUMPTIONS (REQUIRE VALIDATION)
 
 ### Business Context
 
-The transactions datasource supports a high-volume settlement data transaction system:
+The transactions datasource supports a high-volume settlement data transaction system with synchronous query requirements:
 
-- Daily batch collection with 10-year retention for compliance
-- Real-time (U2A) and A2A query processing, 24/7/365 availability
-- No negative impact on DESP performance during query processing
+- **Query Pattern**: Synchronous reporting queries (no real-time streaming)
+- **Hot Data Window**: 7 days (performance-critical)
+- **Data Access**: Queries primarily target recent data (last 7 days)
+- **Availability**: 24/7/365 availability required
 
 ### Objectives
 
-We need to balance four competing priorities:
+**Primary Objective: Performance**
 
-1. **Performance**: Sub-second query latency for recent data (P95 < 500ms)
-2. **Scalability**: Handle 20% annual growth without redesign
-3. **Efficiency**: Keep storage costs reasonable over 10 years
-4. **Reliability**: Minimize operational overhead (99%+ compaction success)
+The main driver for this partitioning strategy is **query performance** for the 7-day hot data window. All design decisions prioritize:
+
+1. **Query Latency**: Sub-second response times for queries on recent data (P95 < 500ms)
+2. **Segment Scan Efficiency**: Minimize the number of segments scanned per query
+3. **Partition Pruning**: Optimize partition selection based on query filters
+
+**Secondary Considerations:**
+- Segment management overhead (avoid too many small segments)
+- Storage efficiency (avoid segments that are too large)
 
 ### Scope
 
-**In Scope:** Time granularity, secondary partitioning, sizing, compaction, dimension ordering
+**In Scope:**
+- Time granularity selection (DAY/HOUR)
+- Secondary partitioning strategy (DYNAMIC/HASH/SINGLE_DIM)
+- Dimension ordering for query optimization
+- Performance scenarios and testing approach
 
-**Out of Scope:** Data source implementation, ingestion pipeline, infrastructure provisioning
+**Out of Scope:**
+- Long-term storage planning (beyond 7 days)
+- Historical data optimization
+- Infrastructure provisioning details
+- Compaction implementation details (separate user story)
 
 ---
 
 ## Data Characteristics
 
-### Volume Projections
+### Volume Projections (7-Day Hot Data Window)
 
-Starting with the settlement system capacity requirements:
+Focusing on the performance-critical 7-day window:
 
 | Metric | Average | Peak |
 |--------|---------|------|
 | **Transactions/day** | 138,240,000 | 1,382,400,000 |
 | **Daily data volume** | 70.8 GB | 707.8 GB |
-| **10-year total** | 258 TB raw | 2.58 PB peak |
+| **7-day total (avg)** | 495.6 GB | 4,954.6 GB |
+| **7-day total (peak)** | ~5 TB | ~5 TB |
 
-At 512 bytes per row (400B dimensions + 100B metrics + 12B overhead), we're looking at roughly 70-700 GB per day depending on load.
+**Calculation basis:**
+- 512 bytes per row (400B dimensions + 100B metrics + 12B overhead)
+- Average: 1,600 transactions/sec
+- Peak: 16,000 transactions/sec
 
-### Expected Query Patterns
+**Note:** These volumes drive the performance requirements. The 7-day window is what matters for query performance optimization.
 
-Based on similar settlement systems I've worked with, we can expect:
+### Query Patterns (To Be Validated)
 
-- **Real-time monitoring** (high frequency): Last 1-24 hours, need < 500ms response
-- **Daily reporting** (medium frequency): Last 7-30 days, can tolerate 1-2 seconds
-- **Historical analysis** (low frequency): Months to years, up to 6 seconds acceptable
-- **Ad-hoc queries** (variable): Unpredictable, but usually recent data
+**Assumed patterns (require validation from actual query logs):**
+- Synchronous reporting queries
+- Primary filters: account_id, country, PSP_id, access_manager_id
+- Time range: Primarily last 7 days
+- Query frequency: To be determined
 
-Assumed primary filters: account_id (~80%), transaction_type (~60%), status (~50%), region (~30%). These percentages need validation from actual query logs.
-
-**Note:** Weekend volume typically drops to ~30% of weekday average in financial systems.
+**Action Required:** Export and analyze 30 days of query logs to validate:
+- Most common filter dimensions
+- Time range patterns
+- Query frequency and patterns
 
 ---
 
 ## Partitioning Strategy
 
-### Time Granularity Decision
+### Understanding Druid Partitioning
 
-#### Why DAY for Segment Granularity
+**Important:** In Druid, all dimensions are automatically indexed with bitmap indexes. There is no separate "indexation" step to activate. The partitioning strategy determines how data is physically organized within time-based segments.
 
-I initially considered HOUR granularity since we have high transaction rates, but the math doesn't support it:
+**Partitioning in Druid works as follows:**
+1. **Temporal Partitioning (Mandatory)**: Data is first partitioned by time using `segmentGranularity`
+2. **Secondary Partitioning (Optional)**: Within each time segment, data can be further partitioned by dimension using:
+   - `dynamic`: Automatic partitioning based on target size (default)
+   - `hash`: Hash-based partitioning on a specific dimension
+   - `single_dim`: Single-dimension partitioning with dynamic ranges
 
-| Granularity | Segments (10y) | Avg Size | Why Not? |
-|-------------|----------------|----------|----------|
-| HOUR | 87,600 | 2.95 GB | Too many segments to manage, metadata overhead kills us |
-| **DAY** | **3,650** | **70.8 GB** | **Sweet spot** |
-| MONTH | 120 | 2.1 TB | Segments too large, queries would scan unnecessary data |
+### Approach: Sequential Testing by Partitioning Type
 
-With DAY granularity:
-- We get ~3,650 segments over 10 years (manageable)
-- Each daily segment can be split into ~138 partitions at 1M rows each
-- Aligns perfectly with the daily data collection requirement
-- Most queries target daily/weekly/monthly ranges anyway
+The partitioning strategy follows a **sequential testing approach** where each partitioning type is tested independently:
 
-The 70 GB average segment size might seem large, but remember it's split into partitions internally. At peak (707 GB), we'll have ~1,382 partitions per day, which is still reasonable for the cluster.
+```
+Scenario 1: Dynamic Partitioning (Baseline)
+    ↓
+Scenario 2: Hash Partitioning on account_id
+    ↓
+Scenario 3: Hash Partitioning on PSP_id
+    ↓
+Scenario 4: Single_dim Partitioning on country
+    ↓
+Scenario 5: Best combination from above
+```
 
-#### Query Granularity: MINUTE
+**Why Sequential Testing?**
+- Each partitioning type is tested independently to measure performance gains
+- Allows incremental optimization without over-engineering
+- Performance testing will determine which partitioning type is optimal
+- Can combine approaches (e.g., hash + single_dim) if beneficial
 
-Going with MINUTE for query granularity because:
-- Real-time monitoring needs fine-grained buckets
-- Fraud detection typically looks at minute-level patterns
-- We can always aggregate up to hour/day for reports
-- Storage impact is acceptable: ~470 MB/min at peak after compression
+### Stage 1: Temporal Granularity (Mandatory)
 
-SECOND granularity would be overkill (14 GB/sec at peak), and HOUR is too coarse for real-time use cases.
+#### Decision Criteria
 
-### Secondary Partitioning Strategy
+The segment granularity must balance:
+1. **Segment size**: Avoid segments too large (slow queries) or too small (metadata overhead)
+2. **Query patterns**: Align with common time ranges in queries
+3. **Ingestion frequency**: Match data collection patterns
 
-#### Hash Partitioning on account_id
+#### Granularity Options Analysis
 
-**Decision:** HASH partitioning on `account_id`
+| Granularity | Segments (7d) | Avg Size | Pros | Cons |
+|-------------|---------------|----------|------|------|
+| **HOUR** | 168 | 2.95 GB | Fine-grained, good for recent data | Many segments to manage |
+| **DAY** | 7 | 70.8 GB | Aligns with daily collection, manageable | Larger segments |
+| **WEEK** | 1 | 495.6 GB | Minimal segments | Too large, poor query performance |
 
-I'm proposing account_id as the partition dimension based on these assumptions:
-- Settlement systems typically have >1M accounts (need to confirm)
-- ~80% of queries filter by account (based on similar projects)
-- Even hash distribution should prevent hot-spotting
+#### Recommended: DAY Granularity
+
+**Justification:**
+- Aligns with daily data collection pattern
+- 7 segments for 7-day window (manageable)
+- Each segment can be split into partitions via secondary partitioning
+- Most queries likely target daily or multi-day ranges
 
 **Configuration:**
+```json
+{
+  "granularitySpec": {
+    "type": "uniform",
+    "segmentGranularity": "DAY",
+    "queryGranularity": "MINUTE"
+  }
+}
+```
 
+**Query Granularity: MINUTE**
+- Fine enough for reporting needs
+- Allows aggregation to hour/day as needed
+- Storage impact acceptable
+
+#### Validation Required
+
+Before finalizing DAY granularity, validate:
+- Actual segment sizes after ingestion
+- Query performance with DAY segments
+- Whether HOUR granularity provides better performance for recent data
+
+### Stage 2: Secondary Partitioning Options
+
+#### Option A: Dynamic Partitioning (Default/Baseline)
+
+**Type:** `dynamic`
+
+**When to use:** Default starting point. Druid automatically creates partitions based on target size.
+
+**Configuration:**
+```json
+{
+  "partitionsSpec": {
+    "type": "dynamic",
+    "maxRowsPerSegment": 5000000,
+    "maxTotalRows": null
+  }
+}
+```
+
+**Characteristics:**
+- Automatic partitioning based on row count
+- No dimension-specific optimization
+- Good for general-purpose workloads
+- Baseline for performance comparison
+
+**Use Case:** Scenario 1 - Baseline testing
+
+#### Option B: Hash Partitioning
+
+**Type:** `hash`
+
+**When to use:** High-cardinality dimension frequently used in query filters (e.g., account_id).
+
+**How it works:** Data is partitioned using a hash function on the specified dimension, ensuring even distribution across partitions.
+
+**Configuration:**
 ```json
 {
   "partitionsSpec": {
@@ -159,450 +338,348 @@ I'm proposing account_id as the partition dimension based on these assumptions:
 }
 ```
 
-**Why this works:**
-- Hash on high-cardinality dimension = even distribution
-- Queries filtering by account only scan 1-5 partitions instead of all 138
-- That's a 60-80% reduction in I/O for most queries
+**Key Parameters:**
+- `partitionDimension`: Dimension to hash on (must be high cardinality)
+- `targetPartitionSize`: Target rows per partition
+- `maxPartitionSize`: Maximum rows before splitting
 
-**Validation needed:**
-We MUST verify account_id cardinality from actual data. If it's < 100K accounts, we need to switch to transaction_id or a composite key. I've seen this assumption fail before on smaller systems.
+**Benefits:**
+- Even distribution across partitions
+- Queries filtering by partitioned dimension scan fewer partitions
+- Good for high-cardinality dimensions (account_id with 320M values)
 
-**Fallback options if account_id doesn't work:**
-- Plan B: transaction_id (guaranteed high cardinality but less query-friendly)
-- Plan C: Composite key (account_id + timestamp_hour)
-- Plan D: RANGE partitioning on timestamp with HASH on transaction_id
+**Trade-offs:**
+- Only benefits queries filtering by the partitioned dimension
+- Queries not filtering by this dimension scan all partitions
+- Requires high cardinality to be effective
 
-**Partition sizing targets:**
-- Target: 1M rows (~500 MB) - proven sweet spot in Druid
-- Max: 2M rows (~1 GB) to handle peak bursts
-- Daily: ~138 partitions average, ~1,382 at peak
+**Use Cases:** 
+- Scenario 2: Hash on `account_id` (if high cardinality confirmed)
+- Scenario 3: Hash on `PSP_id` (if high cardinality and frequently filtered)
+
+#### Option C: Single Dimension Partitioning
+
+**Type:** `single_dim`
+
+**When to use:** Low-to-medium cardinality dimension with clear value ranges (e.g., country with 22 values).
+
+**How it works:** Partitions are created based on ranges of values for a single dimension. Druid automatically determines optimal ranges.
+
+**Configuration:**
+```json
+{
+  "partitionsSpec": {
+    "type": "single_dim",
+    "partitionDimension": "country",
+    "targetRowsPerSegment": 5000000,
+    "maxRowsPerSegment": 10000000
+  }
+}
+```
+
+**Key Parameters:**
+- `partitionDimension`: Dimension to partition on
+- `targetRowsPerSegment`: Target rows per segment
+- `maxRowsPerSegment`: Maximum rows before splitting
+
+**Benefits:**
+- Queries filtering by partitioned dimension scan only relevant partitions
+- Good for low-to-medium cardinality dimensions (country with 22 values)
+- Automatic range optimization by Druid
+
+**Trade-offs:**
+- Queries NOT filtering by partitioned dimension must scan all partitions
+- May create many small partitions if cardinality is high
+- Less effective for very high cardinality dimensions
+
+**Use Case:** 
+- Scenario 4: Single_dim on `country` (22 values, frequently filtered)
+
+### Partition Sizing
+
+**Target Size:** 500 MB - 1 GB per partition (~1M-2M rows)
+
+**Rationale:**
+- Proven sweet spot in Druid for query performance
+- Balances I/O efficiency with metadata overhead
+- Allows parallel processing across partitions
+
+**Configuration Guidelines:**
+- For `hash`: Use `targetPartitionSize: 1024000` (1M rows)
+- For `single_dim`: Use `targetRowsPerSegment: 5000000` (5M rows, will be split)
+- For `dynamic`: Use `maxRowsPerSegment: 5000000` (5M rows)
 
 ---
 
 ## Dimension Design
 
-### Primary Filter Dimensions
+### Known Dimensions
 
-Based on transaction system patterns, proposing this ordering:
+Based on system requirements, the following dimensions are available:
 
-| Priority | Dimension | Expected Cardinality | Filter Frequency | Status |
-|----------|-----------|---------------------|------------------|---------|
-| 1 | `account_id` | High (>1M assumed) | ~80% | **Must validate** |
-| 2 | `transaction_type` | Low (15-20) | ~60% | **Must validate** |
-| 3 | `status` | Very low (3-5) | ~50% | **Must validate** |
-| 4 | `region` | Low (3) | ~30% | Confirmed |
-| 5 | `timestamp` | N/A | 100% (implicit) | Confirmed |
+| Dimension | Expected Cardinality | Notes |
+|-----------|----------------------|-------|
+| `account_id` | ~320M | Very high cardinality - good for hash partitioning |
+| `country` | 22 | Low cardinality - good for single_dim partitioning |
+| `currency` | 1 | Single value - not useful for partitioning |
+| `PSP_id` | To be determined | Requires validation - may be good for hash if high cardinality |
+| `access_manager_id` | To be determined | Requires validation |
+| `transaction_id` | Unique | Guaranteed unique, but query pattern unknown |
+| `timestamp` | N/A | Temporal dimension (handled separately) |
 
-**Ordering logic:** Put highest-cardinality, most-filtered dimensions first. This is standard practice but needs confirmation from actual query logs.
+### Dimension Ordering Strategy
 
-**Clustering strategy:**
-- Primary cluster by account_id to co-locate account transactions
-- Secondary cluster by transaction_type for common account+type queries
+**Principle:** Order dimensions by:
+1. **Cardinality** (highest first)
+2. **Filter frequency** (most filtered first)
 
-**Important:** These filter frequencies are educated guesses. We need 30 days of query logs to validate before finalizing dimension order.
+**Proposed Ordering (to be validated):**
+1. `account_id` (highest cardinality, likely most filtered)
+2. `PSP_id` (if high cardinality and frequently filtered)
+3. `access_manager_id` (if high cardinality and frequently filtered)
+4. `country` (low cardinality, but may be frequently filtered)
+
+**Action Required:**
+- Validate actual cardinality for all dimensions
+- Analyze query logs to determine filter frequency
+- Adjust ordering based on real usage patterns
+
+### Clustering Strategy
+
+**Note:** In Druid, clustering refers to the physical ordering of data within segments. This is different from partitioning.
+
+**Primary cluster by:** `account_id` (if high cardinality confirmed)
+- Co-locates transactions for same account
+- Benefits queries filtering by account
+- Improves compression
+
+**Secondary cluster by:** Most frequently filtered dimension (to be determined from query logs)
 
 ---
 
-## Capacity Planning
+## Performance Scenarios
 
-### Segment Sizing Analysis
+### Testing Approach
 
-Target: 500 MB per partition (1M rows at 512 bytes/row)
+Each scenario will be tested sequentially, measuring performance metrics to determine the optimal configuration. All dimensions are automatically indexed in Druid - the difference is in how data is physically partitioned.
 
-**Daily breakdown:**
+### Scenario 1: Dynamic Partitioning (Baseline)
 
-| Scenario | Rows | Partitions | Storage (raw) | Storage (compressed 2x replication) |
-|----------|------|------------|---------------|-------------------------------------|
-| Average day | 138M | ~138 | 70.8 GB | 47 GB |
-| Peak day | 1,382M | ~1,382 | 707.8 GB | 472 GB |
+**Configuration:**
+- Segment Granularity: DAY
+- Query Granularity: MINUTE
+- Partitioning: `dynamic` (automatic based on size)
+- No dimension-specific partitioning
 
-### Growth Projections
+**Purpose:** Establish baseline performance metrics.
 
-Assuming 20% annual growth (conservative for fintech):
+**Configuration Example:**
+```json
+{
+  "partitionsSpec": {
+    "type": "dynamic",
+    "maxRowsPerSegment": 5000000
+  }
+}
+```
 
-| Timeframe | Daily Rows | Daily Storage (compressed) | Annual Storage |
-|-----------|------------|----------------------------|----------------|
-| **Today** | 138M | 47 GB | 17 TB |
-| **12 months** | 198M | 68 GB | 25 TB |
-| **24 months** | 238M | 81 GB | 30 TB |
-| **10 years** | — | — | 170-300 TB |
+**Metrics to Measure:**
+- Query latency (P50, P95, P99)
+- Number of segments scanned per query
+- Data scanned (MB) per query
+- Memory usage
+- Cache hit rate
 
-The 170-300 TB range for 10 years accounts for compounding growth. Budget should plan for 300 TB to be safe.
+**Expected Results:**
+- All queries scan full daily segments
+- Performance acceptable for simple queries
+- May not meet SLA for complex queries
+- Baseline for comparison
 
-### Performance Targets
+### Scenario 2: Hash Partitioning on account_id
 
-| Metric | Target | Notes |
-|--------|--------|-------|
-| Query latency (P95, recent) | < 500ms | Account-filtered, last 24h |
-| Query latency (P95, historical) | < 2,000ms | Multi-day range queries |
-| Ingestion throughput | 16,000 events/sec | Sustained peak load |
-| Segment scan efficiency | > 80% | Partitions actually read vs total |
-| Compaction success rate | > 99% | Daily measurement |
+**Configuration:**
+- Segment Granularity: DAY
+- Query Granularity: MINUTE
+- Partitioning: `hash` on `account_id`
+- Target: 1M rows per partition
 
-These targets are based on Druid best practices and similar high-volume deployments.
+**Purpose:** Measure performance gain from hash partitioning on high-cardinality dimension.
+
+**Configuration Example:**
+```json
+{
+  "partitionsSpec": {
+    "type": "hash",
+    "targetPartitionSize": 1024000,
+    "maxPartitionSize": 2048000,
+    "partitionDimension": "account_id"
+  }
+}
+```
+
+**Metrics to Measure:**
+- Query latency (P50, P95, P99) vs Scenario 1
+- Number of segments/partitions scanned per query vs Scenario 1
+- Data scanned (MB) per query vs Scenario 1
+- Performance for account-filtered queries
+- Performance for queries NOT filtering by account (may degrade)
+
+**Expected Results:**
+- Queries filtering by `account_id`: Should scan fewer partitions, better performance
+- Queries NOT filtering by account: May scan all partitions, potentially slower
+- Net benefit depends on query pattern distribution
+
+### Scenario 3: Hash Partitioning on PSP_id
+
+**Configuration:**
+- Segment Granularity: DAY
+- Query Granularity: MINUTE
+- Partitioning: `hash` on `PSP_id`
+- Target: 1M rows per partition
+
+**Purpose:** Measure performance gain from hash partitioning on PSP_id (if high cardinality).
+
+**Configuration Example:**
+```json
+{
+  "partitionsSpec": {
+    "type": "hash",
+    "targetPartitionSize": 1024000,
+    "maxPartitionSize": 2048000,
+    "partitionDimension": "PSP_id"
+  }
+}
+```
+
+**Metrics to Measure:** (Same as Scenario 2, but for PSP_id)
+
+**Expected Results:**
+- Performance improvement for PSP-filtered queries
+- Comparison with Scenario 2 to determine best dimension for hash partitioning
+
+### Scenario 4: Single Dimension Partitioning on country
+
+**Configuration:**
+- Segment Granularity: DAY
+- Query Granularity: MINUTE
+- Partitioning: `single_dim` on `country`
+- Target: 5M rows per segment (will be split by country)
+
+**Purpose:** Measure performance gain/loss from single_dim partitioning on low-cardinality dimension.
+
+**Configuration Example:**
+```json
+{
+  "partitionsSpec": {
+    "type": "single_dim",
+    "partitionDimension": "country",
+    "targetRowsPerSegment": 5000000,
+    "maxRowsPerSegment": 10000000
+  }
+}
+```
+
+**Metrics to Measure:**
+- Query latency (P50, P95, P99) vs Scenario 1
+- Number of segments/partitions scanned per query
+- Performance for country-filtered queries
+- Performance for queries NOT filtering by country (may degrade)
+- Partition count per day segment
+
+**Expected Results:**
+- Country-filtered queries: Should scan fewer partitions, better performance
+- Non-country-filtered queries: May scan all partitions, potentially slower
+- Net benefit depends on query pattern distribution
+- Should create ~22 partitions per day (one per country)
+
+### Scenario 5: Combined Partitioning (if beneficial)
+
+**Configuration:**
+- Segment Granularity: DAY
+- Query Granularity: MINUTE
+- Primary Partitioning: Best from Scenarios 2-4
+- Note: Druid supports one partitioning strategy per ingestion. For combined benefits, may need to:
+  - Use hash on high-cardinality dimension (account_id)
+  - Use compaction with different strategy if needed
+  - Or accept trade-offs
+
+**Purpose:** Measure combined optimization impact (if applicable).
+
+**Note:** Druid typically uses one partitioning strategy per ingestion. However, compaction can use a different strategy, potentially combining benefits.
+
+**Metrics to Measure:**
+- Query latency vs all previous scenarios
+- Overall performance across different query patterns
+- Resource usage (memory, CPU)
+- Operational complexity
+
+**Expected Results:**
+- Best performance for queries matching the chosen partitioning
+- Trade-offs for other query patterns
+- Higher operational complexity
+
+### Performance Metrics Definition
+
+For each scenario, measure:
+
+| Metric | Description | Target |
+|--------|-------------|--------|
+| **Query Latency P95** | 95th percentile query response time | < 500ms |
+| **Segments Scanned** | Number of segments opened per query | Minimize |
+| **Partitions Scanned** | Number of partitions read per query | Minimize |
+| **Data Scanned** | MB of data read per query | Minimize |
+| **Cache Hit Rate** | Percentage of queries served from cache | > 60% |
+| **Memory Usage** | Memory overhead from partitions | Monitor |
+| **Query Success Rate** | Percentage of successful queries | > 99% |
+
+### Decision Criteria
+
+**Choose Hash Partitioning if:**
+- Scenario 2/3 shows >20% improvement in latency for filtered queries
+- Dimension has high cardinality (>100K values)
+- Dimension is frequently used in query filters
+- Trade-off for non-filtered queries is acceptable
+
+**Choose Single_dim Partitioning if:**
+- Scenario 4 shows >20% improvement in latency for filtered queries
+- Dimension has low-to-medium cardinality (10-1000 values)
+- Dimension is frequently used in query filters
+- Trade-off for non-filtered queries is acceptable
+
+**Stay with Dynamic if:**
+- No partitioning strategy shows significant improvement
+- Query patterns are too diverse
+- Operational simplicity is preferred
+
+**Final Selection:**
+- Choose scenario with best overall performance
+- Consider operational complexity
+- Document trade-offs for future reference
+- Validate with production-like query patterns
 
 ---
 
 ## Compaction Strategy
 
-### Configuration Approach
+### Why Compaction is Needed
 
-Compaction is critical here because we're ingesting at high rates and will accumulate many small segments without it.
+**Problem:** High-volume ingestion creates many small segments initially, leading to:
+- Metadata overhead
+- Slower queries (many segments to scan)
+- Management complexity
 
-**Core config:**
+**Solution:** Compaction consolidates small segments into optimal-sized partitions while optionally changing the partitioning strategy.
 
-```json
-{
-  "dataSource": "transactions",
-  "taskPriority": 25,
-  "maxRowsPerSegment": 1024000,
-  "skipOffsetFromLatest": "PT6H",
-  "tuningConfig": {
-    "maxNumConcurrentSubTasks": 4,
-    "maxRowsInMemory": 500000,
-    "partitionsSpec": {
-      "type": "hash",
-      "targetPartitionSize": 1024000,
-      "maxPartitionSize": 2048000,
-      "partitionDimension": "account_id"
-    }
-  }
-}
-```
+### Approach
 
-**Key parameters:**
-- `skipOffsetFromLatest: PT6H` - Don't compact last 6 hours to avoid conflicts with active ingestion
-- `taskPriority: 25` - Lower than ingestion (50) so it doesn't interfere
-- `maxRowsInMemory: 500K` - Conservative to avoid OOM issues
+**Core Principle:** Consolidate segments to target size (1M-2M rows, ~500 MB - 1 GB) while maintaining or optimizing partitioning strategy.
 
-### Tiered Schedule
-
-Rather than one-size-fits-all compaction, we need tiered approach:
-
-**Short-term (6-24h old data):**
-- Run every 6 hours continuously
-- Quick consolidation of newly closed segments
-- Low priority, opportunistic
-
-**Near-term (1-7d old data):**
-- Run daily at 02:00-06:00 (assumed low-traffic window)
-- Consolidate into optimal daily partitions
-- Higher priority, should complete within 4 hours
-
-**Medium-term (7-30d old data):**
-- Run weekly on weekends
-- Further reduce segment count
-- Can take longer, less time-sensitive
-
-**Long-term (30d+ old data):**
-- Run monthly during maintenance windows
-- Final optimization for cold data
-- Lowest priority, can be deferred if needed
-
-### Expected Outcomes
-
-From experience with similar setups:
-- Segment count reduction: 20-40% for historical data
-- Query performance: 15-35% faster for multi-day queries
-- Storage: 5-15% savings from better compression
-- Compaction time: Should complete in < 1 hour per day under normal load
-
-### Operational Notes
-
-- Keep original segments for 48h before deletion (allows rollback if compaction issues)
-- Alert if compaction queue grows beyond 2x expected duration
-- Consider dedicated compaction workers if regular workers get overloaded
-- Monitor compaction task failures closely - they're usually early warning signs
-
----
-
-## Performance Considerations
-
-### How Partition Pruning Works
-
-With DAY segments + HASH partitioning on account_id:
-
-**Example query: "Show transactions for account X in last hour"**
-1. Time filter → Scan only today's segment (1 day segment)
-2. account_id filter → Hash lookup → Scan only 1-5 partitions out of ~138
-3. Result: Reading ~1-4% of data instead of 100%
-
-**Query performance expectations:**
-
-| Query Pattern | Partitions Scanned | Expected Latency |
-|---------------|-------------------|------------------|
-| Single account, last hour | 1-5 of 138 (~1-4%) | < 300ms |
-| Account + type, last 7 days | 7-35 total | < 1,500ms |
-| Region query, 30 days | All partitions in region | < 6,000ms |
-| Full scan, historical | All segments | Minutes (rare case) |
-
-### Trade-offs We're Making
-
-**Pros of this approach:**
-- Manageable segment count over 10 years
-- Good query performance for common patterns
-- Straightforward to maintain and troubleshoot
-- Scales with volume growth
-
-**Cons:**
-- Large daily segments (70 GB avg, 707 GB peak)
-- Queries on very recent data still read larger segment files (mitigated by partition pruning)
-- Need careful monitoring to catch partition skew
-
-**Mitigation strategies:**
-- Segment cache for last 7 days (hot data)
-- Result caching for common queries
-- Parallel execution leverages multiple partitions
-- Compaction keeps segments optimized
-
-### Monitoring Essentials
-
-**Critical metrics to watch:**
-
-| Metric | Target | Alert If |
-|--------|--------|----------|
-| Query latency P95 | < 500ms | > 1,000ms |
-| Segment scan efficiency | > 80% | < 60% |
-| Compaction success | > 99% | < 95% |
-| Compaction duration | < 1h/day | > 4h/day |
-| Ingestion lag | < 5 min | > 15 min |
-
-**What to tune if performance degrades:**
-1. Check partition distribution - might have hot shards
-2. Verify compaction is keeping up
-3. Look at query patterns - might need dimension reordering
-4. Consider increasing segment cache size
-5. Scale workers if resource-bound
-
----
-
-## Risk Analysis
-
-### Major Risks and Mitigation
-
-**Risk 1: Volume is 10x higher than expected**
-- Likelihood: Low
-- Impact: High (cluster can't keep up)
-- Mitigation:
-    - Fall back to HOUR segmentation (already sized it out)
-    - Increase maxPartitionSize to 5M rows
-    - Add worker nodes (already have capacity plan for 2x growth)
-    - Implement aggressive compaction
-
-**Risk 2: account_id cardinality too low (<100K)**
-- Likelihood: Medium
-- Impact: High (poor partition distribution, hot shards)
-- Mitigation:
-    - Switch to transaction_id (guaranteed unique)
-    - Use composite key (account_id + region)
-    - Retest partition distribution before go-live
-    - Keep 72h rollback window
-
-**Risk 3: Query patterns completely different from assumptions**
-- Likelihood: Medium
-- Impact: Medium (suboptimal performance)
-- Mitigation:
-    - Get actual query logs ASAP for validation
-    - Reorder dimensions based on real usage
-    - Consider multi-dimensional partitioning
-    - Document actual patterns in runbook
-
-**Risk 4: Compaction can't keep up at peak**
-- Likelihood: Low
-- Impact: Medium (segment sprawl, slower queries)
-- Mitigation:
-    - Increase compaction worker pool
-    - Adjust compaction windows to off-peak times
-    - Implement batch compaction for catch-up
-    - Alert on compaction backlog
-
-**Risk 5: Storage costs exceed budget**
-- Likelihood: Low
-- Impact: Medium (budget overrun)
-- Mitigation:
-    - Move >90d data to cold storage tier
-    - Review retention policy (maybe 10 years is overkill?)
-    - Improve compression settings
-    - Archive least-accessed historical data
-
-### Fallback Scenarios
-
-**If performance targets not met after 2 weeks:**
-1. Enable aggressive result caching
-2. Increase segment replication for hot data
-3. Revisit dimension ordering with actual query patterns
-4. Consider switching to HOUR segmentation for recent data only
-
-**If partition distribution is skewed:**
-1. Switch partitioning dimension within 1 week
-2. Test composite keys
-3. Adjust hash function if needed
-4. Keep original segments for 72h rollback
-
-**If ingestion can't sustain peak load:**
-1. Immediate: Scale Kafka consumer tasks
-2. Short-term: Add ingestion workers
-3. Long-term: Implement backpressure handling
-4. Fallback: Temporarily reduce parallelism if cluster unstable
-
----
-
-## Validation Plan
-
-### Pre-Implementation Tasks
-
-Before we go live, we need to validate these assumptions:
-
-| Task | Owner | Duration | Deadline | Method |
-|------|-------|----------|----------|--------|
-| **Query log analysis** | Lead Data Engineer | 3 days | -2 weeks | Druid console, export last 30d logs |
-| **Cardinality check** | DBA | 1 day | -2 weeks | Sample 1M rows from source DB |
-| **Hash distribution test** | Platform Engineer | 2 days | -10 days | Python script on sample data |
-| **Canary compaction** | Data Engineer | 3 days | -1 week | Test cluster with 2 days real data |
-| **Performance benchmark** | Platform Engineer | 2 days | -1 week | Run 50 representative queries |
-| **Capacity check** | Infrastructure | 1 day | -1 week | Verify cluster can handle load |
-| **Monitoring setup** | DevOps | 2 days | -3 days | Grafana dashboards + alerts |
-| **Rollback test** | Data Engineer | 1 day | -3 days | Practice restore procedure |
-
-**Total effort:** About 8 person-days spread over 2-3 weeks
-
-### Success Criteria
-
-**Must pass before production:**
-- account_id cardinality confirmed > 100K
-- Hash distribution variance < 20%
-- P95 query latency < 500ms on test data
-- Compaction completes in < 1h for 1-day window
-- No segments > 1 GB after compaction
-- All monitoring dashboards working
-
-**Yellow flags (proceed with caution):**
-- account_id cardinality 50K-100K (watch for hot shards)
-- Hash variance 20-30% (monitor closely)
-- Compaction takes 1-2h (may need more workers)
-
-**Red flags (stop and revisit):**
-- account_id cardinality < 50K
-- Hash variance > 30%
-- P95 latency > 1,000ms
-- Compaction takes > 4h
-
-### Post-Launch Monitoring
-
-**Week 1:**
-- Daily standup review of metrics
-- Watch for partition hot spots
-- Verify compaction completion rates
-- Be ready to rollback if needed
-
-**Weeks 2-4:**
-- Weekly performance reports
-- Fine-tune based on actual load
-- Validate growth projections
-- Document any surprises
-
-**Day 30 review:**
-- Formal performance assessment
-- Update document with real data
-- Plan any needed optimizations
-- Close out validation phase
-
----
-
-## Approval
-
-### Review Workflow
-
-| Stage | Reviewer | Role | Status | Comments |
-|-------|----------|------|--------|----------|
-| **Technical Review** | [Name] | Lead Data Engineer | Pending | Need feedback on partitioning approach |
-| **Architecture Review** | [Name] | Data Architect | Pending | Validate against standards |
-| **Performance Review** | [Name] | Platform Engineer | Pending | Confirm capacity assumptions |
-| **Business Review** | [Name] | Product Owner | Pending | Verify query requirements |
-| **Final Sign-off** | [Name] | Technical Director | Pending | Approve for production |
-
-### Outstanding Items
-
-Before final approval, need to complete:
-1. Confirm account_id cardinality from production sample
-2. Get 30 days query logs to validate filter frequencies
-3. Finalize complete dimension list with actual schema
-4. Complete Kafka ingestion spec with real topic names
-
-**Estimated time:** 2-3 weeks
-
-### Sign-Off
-
-**Data Architecture Approval:**
-
-- **Approved by:** ________________
-- **Title:** ________________
-- **Date:** ________________
-- **Signature:** ________________
-
----
-
-## Appendices
-
-### Appendix A: Ingestion Configuration
-
-**Kafka Supervisor (adjust topic/broker as needed):**
-
-```json
-{
-  "type": "kafka",
-  "dataSchema": {
-    "dataSource": "transactions",
-    "timestampSpec": {
-      "column": "timestamp",
-      "format": "iso"
-    },
-    "dimensionsSpec": {
-      "dimensions": [
-        "account_id",
-        "transaction_type",
-        "status",
-        "region"
-      ]
-    },
-    "metricsSpec": [
-      {"name": "amount", "type": "doubleSum", "fieldName": "amount"}
-    ],
-    "granularitySpec": {
-      "type": "uniform",
-      "segmentGranularity": "DAY",
-      "queryGranularity": "MINUTE",
-      "rollup": false
-    }
-  },
-  "ioConfig": {
-    "topic": "transactions",
-    "consumerProperties": {
-      "bootstrap.servers": "kafka-broker:9092"
-    },
-    "taskCount": 4,
-    "replicas": 1,
-    "taskDuration": "PT1H"
-  },
-  "tuningConfig": {
-    "type": "kafka",
-    "maxRowsPerSegment": 1024000,
-    "maxRowsInMemory": 500000,
-    "maxNumConcurrentSubTasks": 4,
-    "intermediatePersistPeriod": "PT5M"
-  }
-}
-```
-
-**Note:** Additional dimensions and metrics TBD based on final schema
-
-### Appendix B: Compaction Configuration
-
+**Configuration:**
 ```json
 {
   "type": "compact",
   "dataSource": "transactions",
-  "interval": "2025-12-01/2025-12-02",
   "taskPriority": 25,
   "maxRowsPerSegment": 1024000,
   "skipOffsetFromLatest": "PT6H",
@@ -615,68 +692,234 @@ Before final approval, need to complete:
       "targetPartitionSize": 1024000,
       "maxPartitionSize": 2048000,
       "partitionDimension": "account_id"
-    },
-    "indexSpec": {
-      "bitmap": {"type": "roaring"},
-      "dimensionCompression": "lz4",
-      "metricCompression": "lz4"
     }
   }
 }
 ```
 
-Submit via: `POST /druid/indexer/v1/task`
+**Key Parameters:**
+- `skipOffsetFromLatest: PT6H` - Don't compact last 6 hours (active ingestion window)
+- `taskPriority: 25` - Lower than ingestion priority (50) to avoid interference
+- `maxRowsInMemory: 500K` - Conservative to avoid OOM
+- `partitionsSpec`: Can use different partitioning strategy than initial ingestion
 
-### Appendix C: Compaction Schedule Visual
+**Important:** Compaction can use a different partitioning strategy than initial ingestion. This allows optimization after understanding query patterns.
 
+**Note:** The exact compaction strategy (frequency, schedule) will be defined in a separate user story. This section focuses on the approach and configuration.
+
+### Expected Outcomes
+
+- Segment count reduction: 20-40% for historical data
+- Query performance: 15-35% faster for multi-day queries
+- Storage: 5-15% savings from better compression
+- Option to optimize partitioning strategy based on learned query patterns
+
+---
+
+## Validation Plan
+
+### Pre-Implementation Validation
+
+Before finalizing the strategy, validate:
+
+| Task | Method | Success Criteria |
+|------|--------|------------------|
+| **Dimension Cardinality** | Sample 1M rows from source | Confirm actual cardinalities |
+| **Query Log Analysis** | Export 30 days from Druid console | Identify filter frequencies |
+| **Volume Validation** | Measure actual ingestion | Confirm 7-day volume estimates |
+| **Segment Size Test** | Ingest 1 day of data | Verify segment sizes match expectations |
+
+### Performance Testing Plan
+
+**Phase 1: Baseline (Scenario 1)**
+- Ingest 7 days of data with DAY granularity and dynamic partitioning
+- Run representative query set
+- Measure all performance metrics
+- Document baseline performance
+
+**Phase 2: Hash Partitioning Testing (Scenarios 2-3)**
+- Test hash partitioning on `account_id`
+- Test hash partitioning on `PSP_id` (if high cardinality)
+- Compare performance vs baseline
+- Document improvements/degradations
+
+**Phase 3: Single_dim Partitioning Testing (Scenario 4)**
+- Test single_dim partitioning on `country`
+- Measure performance for different query patterns
+- Document trade-offs
+
+**Phase 4: Final Selection**
+- Compare all scenarios
+- Select optimal partitioning strategy
+- Validate overall performance meets targets
+- Finalize configuration
+
+### Success Criteria
+
+**Must meet before production:**
+- P95 query latency < 500ms for 7-day queries
+- Segment scan efficiency > 80% (partitions read vs total)
+- All performance scenarios documented with results
+- Dimension cardinalities confirmed
+- Query patterns validated
+
+**Documentation Required:**
+- Performance test results for each scenario
+- Comparison matrix showing trade-offs
+- Final configuration with justification
+- Operational runbook for chosen strategy
+
+---
+
+## Appendices
+
+### Appendix A: Ingestion Configuration Example
+
+**Kafka Supervisor (example - to be finalized):**
+
+```json
+{
+  "type": "kafka",
+  "spec": {
+    "ioConfig": {
+      "type": "kafka",
+      "consumerProperties": {
+        "bootstrap.servers": "kafka-broker:9092"
+      },
+      "topic": "transactions",
+      "inputFormat": {
+        "type": "json"
+      },
+      "useEarliestOffset": true,
+      "taskCount": 4,
+      "replicas": 1,
+      "taskDuration": "PT1H"
+    },
+    "tuningConfig": {
+      "type": "kafka",
+      "maxRowsInMemory": 100000,
+      "maxRowsPerSegment": 5000000,
+      "partitionsSpec": {
+        "type": "dynamic"
+      }
+    },
+    "dataSchema": {
+      "dataSource": "transactions",
+      "timestampSpec": {
+        "column": "timestamp",
+        "format": "millis"
+      },
+      "dimensionsSpec": {
+        "dimensions": [
+          "account_id",
+          "country",
+          "currency",
+          "PSP_id",
+          "access_manager_id",
+          "transaction_id"
+        ]
+      },
+      "metricsSpec": [
+        {
+          "type": "doubleSum",
+          "name": "amount",
+          "fieldName": "amount"
+        }
+      ],
+      "granularitySpec": {
+        "type": "uniform",
+        "segmentGranularity": "DAY",
+        "queryGranularity": "MINUTE",
+        "rollup": false
+      }
+    }
+  }
+}
 ```
-Compaction Timeline (by data age)
-───────────────────────────────────────────────────────────
-timeline
-    title Compaction Timeline
-    0h       : Hot data
-    6h       : Short compaction window (every 6h)
-    24h      : Near-line compaction (daily 02:00-06:00)
-    7d       : Medium window (weekly Sat 02:00)
-    30d      : Long window (monthly 1st Sun 02:00)
-    1y       : Archive start
-    10y      : Archive end
 
+**Note:** Final dimensions and metrics to be confirmed from actual schema. Partitioning strategy will be updated based on performance testing results.
 
-Execution:
-  Short  : Every 6h, continuous
-  Near   : Daily 02:00-06:00
-  Medium : Weekly Sat 02:00
-  Long   : Monthly 1st Sun 02:00
+### Appendix B: Performance Testing Query Examples
 
-Skip last 6h to avoid ingestion conflicts
+**Query 1: Single Account, Last 24 Hours**
+```sql
+SELECT COUNT(*) 
+FROM transactions 
+WHERE account_id = 'XXX' 
+  AND __time >= CURRENT_TIMESTAMP - INTERVAL '1' DAY
 ```
 
-### Appendix D: Quick Reference Links
+**Query 2: Country Filter, Last 7 Days**
+```sql
+SELECT country, SUM(amount) 
+FROM transactions 
+WHERE country = 'FR' 
+  AND __time >= CURRENT_TIMESTAMP - INTERVAL '7' DAY
+GROUP BY country
+```
 
-- [Druid Segment Optimization](https://druid.apache.org/docs/latest/operations/segment-optimization.html)
+**Query 3: PSP Filter, Last Day**
+```sql
+SELECT COUNT(*) 
+FROM transactions 
+WHERE PSP_id = 'YYY' 
+  AND __time >= CURRENT_TIMESTAMP - INTERVAL '1' DAY
+```
+
+**Query 4: Multi-dimension Filter**
+```sql
+SELECT account_id, COUNT(*) 
+FROM transactions 
+WHERE account_id = 'XXX' 
+  AND country = 'FR'
+  AND __time >= CURRENT_TIMESTAMP - INTERVAL '7' DAY
+GROUP BY account_id
+```
+
+**Note:** Actual query set to be defined based on real usage patterns.
+
+### Appendix C: Druid Partitioning Types Reference
+
+**Dynamic Partitioning:**
+- Type: `dynamic`
+- Use case: Default, general-purpose
+- Configuration: `maxRowsPerSegment`
+- Pros: Automatic, simple
+- Cons: No dimension-specific optimization
+
+**Hash Partitioning:**
+- Type: `hash`
+- Use case: High-cardinality dimension (e.g., account_id with 320M values)
+- Configuration: `partitionDimension`, `targetPartitionSize`
+- Pros: Even distribution, good for filtered queries
+- Cons: Only benefits queries filtering by partitioned dimension
+
+**Single Dimension Partitioning:**
+- Type: `single_dim`
+- Use case: Low-to-medium cardinality dimension (e.g., country with 22 values)
+- Configuration: `partitionDimension`, `targetRowsPerSegment`
+- Pros: Good for filtered queries, automatic range optimization
+- Cons: May create many partitions, only benefits filtered queries
+
+### Appendix D: Reference Links
+
 - [Druid Partitioning Guide](https://druid.apache.org/docs/latest/ingestion/partitioning.html)
+- [Druid Segment Optimization](https://druid.apache.org/docs/latest/operations/segment-optimization.html)
 - [Compaction Documentation](https://druid.apache.org/docs/latest/data-management/compaction.html)
-- [Performance Tuning FAQ](https://druid.apache.org/docs/latest/operations/performance-faq.html)
-
-### Appendix E: Change History
-
-| Version | Date              | Author | Changes |
-|---------|-------------------|--------|---------|
-| 1.0 | December 09, 2025 |  | Initial design with validation plan |
+- [Druid Indexing](https://druid.apache.org/docs/latest/ingestion/index.html)
 
 ---
 
 ## Document Status
 
-**Current state:** ~85% complete - core strategy defined, awaiting data validation
+**Current state:** Strategy defined with correct Druid concepts, awaiting validation and performance testing
 
 **Next actions:**
-1. Execute validation plan (1 weeks)
-2. Update assumptions with real data
-3. Schedule architecture review
-4. Get final approvals
-
+1. Validate dimension cardinalities
+2. Analyze query logs (30 days)
+3. Execute performance testing scenarios
+4. Finalize configuration based on test results
+5. Document final strategy with justifications
 
 ---
 

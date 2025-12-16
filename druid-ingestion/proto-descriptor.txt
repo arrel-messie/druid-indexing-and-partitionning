@@ -3,7 +3,6 @@ syntax = "proto3";
 package com.kafka.injector.proto.paiement;
 
 option java_package = "com.kafka.injector.proto.paiement";
-
 option java_outer_classname = "PaiementProto";
 
 message Paiement {
