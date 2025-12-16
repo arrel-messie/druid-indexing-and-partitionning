@@ -269,8 +269,7 @@
 **Review Status:** Draft - Pending Validation
 
 **Required Actions Before Approval:**
-- [ ] Validate dimension cardinalities from production sample
-- [ ] Analyze 30 days of query logs to confirm filter frequencies
+
 - [ ] Execute performance testing scenarios (see below)
 - [ ] Data Architecture review and sign-off
 
