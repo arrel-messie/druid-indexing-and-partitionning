@@ -10,9 +10,10 @@
       "inputFormat": {
         "type": "protobuf",
         "protoBytesDecoder": {
-          "type": "file",
-          "descriptor": "syntax = \"proto3\";\n\npackage com.kafka.injector.proto.paiement;\n\noption java_package = \"com.kafka.injector.proto.paiement\";\noption java_outer_classname = \"PaiementProto\";\n\nmessage Paiement {\n  string transaction_id = 1;\n  double montant = 2;\n  MethodePaiement methode = 3;\n  string commande_id = 4;\n  int64 timestamp = 5;\n}\n\nenum MethodePaiement {\n  CARTE = 0;\n  VIREMENT = 1;\n  PAYPAL = 2;\n  CRYPTO = 3;\n}\n",
-          "protoMessageType": "com.kafka.injector.proto.paiement.Paiement"
+          "type": "schema_registry",
+          "url": "http://localhost:8085",
+          "capacity": 100,
+          "config": {}
         }
       },
       "useEarliestOffset": false,

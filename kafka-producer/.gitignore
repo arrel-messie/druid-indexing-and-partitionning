@@ -1,16 +1,25 @@
+# Maven
 target/
-*.class
-*.jar
-*.war
-*.ear
-*.log
-logs/
+dependency-reduced-pom.xml
+
+# IDE
 .idea/
 *.iml
-.DS_Store
 *.swp
 *.swo
 *~
 
+# Logs
+logs/
+*.log
 
+# OS
+.DS_Store
 
+# Compiled classes
+*.class
+
+# Archives
+*.jar
+*.war
+*.ear

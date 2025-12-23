@@ -21,6 +21,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Supplier;
 
 /**
  * Generic Kafka Producer for Transactions with Protobuf Schema
@@ -170,8 +171,11 @@ public class TransactionProducer {
         double montant = randomDataEnabled 
             ? montantMin + (montantMax - montantMin) * random.nextDouble()
             : montantMin;
+        Supplier<PaiementProto.MethodePaiement> randomMethode = () -> {
+            PaiementProto.MethodePaiement[] methodes = PaiementProto.MethodePaiement.values();
+            return methodes[random.nextInt(methodes.length)];};
         PaiementProto.MethodePaiement methode = randomDataEnabled
-            ? PaiementProto.MethodePaiement.values()[random.nextInt(PaiementProto.MethodePaiement.values().length)]
+            ? randomMethode.get()
             : PaiementProto.MethodePaiement.CARTE;
         String commandeId = commandeIdPrefix + UUID.randomUUID().toString().substring(0, 8).toUpperCase();
         long timestamp = System.currentTimeMillis();
