@@ -4,34 +4,54 @@
     "ioConfig": {
       "type": "kafka",
       "consumerProperties": {
-        "bootstrap.servers": "kafka:29092"
+        "bootstrap.servers": "${KAFKA_BOOTSTRAP_SERVERS}",
+        "security.protocol": "SASL_SSL",
+        "sasl.mechanism": "PLAIN",
+        "sasl.jaas.config": "${KAFKA_SASL_JAAS_CONFIG}",
+        "ssl.endpoint.identification.algorithm": "https",
+        "group.id": "druid-transactions-prod",
+        "fetch.min.bytes": 1048576,
+        "fetch.max.wait.ms": 500,
+        "max.poll.records": 500,
+        "session.timeout.ms": 30000,
+        "heartbeat.interval.ms": 3000,
+        "max.poll.interval.ms": 300000,
+        "enable.auto.commit": false
       },
-      "topic": "Transactions",
+      "topic": "settlement-transactions-prod",
       "inputFormat": {
         "type": "protobuf",
         "protoBytesDecoder": {
           "type": "schema_registry",
-          "url": "http://localhost:8085",
-          "capacity": 100,
-          "config": {}
+          "url": "${SCHEMA_REGISTRY_URL}",
+          "capacity": 1000,
+          "config": {
+            "basic.auth.credentials.source": "USER_INFO",
+            "basic.auth.user.info": "${SCHEMA_REGISTRY_USER}:${SCHEMA_REGISTRY_PASSWORD}",
+            "schema.registry.url": "${SCHEMA_REGISTRY_URL}"
+          }
         }
       },
       "useEarliestOffset": false,
-      "consumerGroupId": "druid-transactions-consumer",
-      "replicas": 1,
-      "taskCount": 1,
+      "useTransaction": true,
+      "taskCount": 10,
+      "replicas": 2,
       "taskDuration": "PT1H",
-      "completionTimeout": "PT30M",
-      "lateMessageRejectionPeriod": "PT1H"
+      "startDelay": "PT5S",
+      "period": "PT30S",
+      "completionTimeout": "PT1H",
+      "lateMessageRejectionPeriod": "PT1H",
+      "pollTimeout": 100,
+      "minimumMessageTime": "1970-01-01T00:00:00.000Z"
     },
     "tuningConfig": {
       "type": "kafka",
-      "maxRowsInMemory": 100000,
-      "maxBytesInMemory": 0,
+      "maxRowsInMemory": 500000,
+      "maxBytesInMemory": 536870912,
       "maxRowsPerSegment": 5000000,
-      "partitionsSpec": {
-        "type": "dynamic"
-      },
+      "maxTotalRows": null,
+      "intermediatePersistPeriod": "PT10M",
+      "maxPendingPersists": 2,
       "indexSpec": {
         "bitmap": {
           "type": "roaring"
@@ -40,43 +60,116 @@
         "metricCompression": "lz4",
         "longEncoding": "longs"
       },
-      "maxPendingPersists": 0,
-      "reportParseExceptions": false,
-      "handoffConditionTimeout": 0,
+      "indexSpecForIntermediatePersists": {
+        "bitmap": {
+          "type": "roaring"
+        },
+        "dimensionCompression": "lz4",
+        "metricCompression": "lz4",
+        "longEncoding": "longs"
+      },
+      "reportParseExceptions": true,
+      "handoffConditionTimeout": 900000,
       "resetOffsetAutomatically": false,
-      "intermediateHandoffPeriod": "PT10M",
-      "logParseExceptions": false,
-      "maxParseExceptions": 0,
-      "maxSavedParseExceptions": 0
+      "workerThreads": null,
+      "chatThreads": null,
+      "chatRetries": 8,
+      "httpTimeout": "PT10S",
+      "shutdownTimeout": "PT80S",
+      "offsetFetchPeriod": "PT30S",
+      "intermediateHandoffPeriod": "P2147483647D",
+      "logParseExceptions": true,
+      "maxParseExceptions": 10000,
+      "maxSavedParseExceptions": 100,
+      "skipSequenceNumberAvailabilityCheck": false,
+      "partitionsSpec": {
+        "type": "dynamic"
+      },
+      "splitHintSpec": {
+        "type": "maxSize",
+        "maxSplitSize": 1073741824,
+        "maxInputSegmentBytesPerTask": 10737418240
+      }
     },
     "dataSchema": {
-      "dataSource": "Transactions",
+      "dataSource": "idm_settlement_snapshot",
       "timestampSpec": {
-        "column": "timestamp",
-        "format": "millis"
+        "column": "settlement_timestamp",
+        "format": "auto",
+        "missingValue": null
+      },
+      "transformSpec": {
+        "transforms": [],
+        "filter": null
       },
       "dimensionsSpec": {
         "dimensions": [
           {
-            "type": "string",
-            "name": "transaction_id"
+            "type": "long",
+            "name": "payment_debited_access_manager_identifier"
+          },
+          {
+            "type": "long",
+            "name": "payment_crebited_access_manager_identifier"
           },
           {
             "type": "string",
-            "name": "methode"
+            "name": "settlement_settlement_transaction_type"
           },
           {
             "type": "string",
-            "name": "commande_id"
+            "name": "settlement_settlement_transaction_status"
+          },
+          {
+            "type": "string",
+            "name": "payment_currency_code"
+          },
+          {
+            "type": "string",
+            "name": "uetr"
+          },
+          {
+            "type": "long",
+            "name": "settlement_settlement_transaction_identifier"
+          },
+          {
+            "type": "string",
+            "name": "payment_payer_identifier"
+          },
+          {
+            "type": "string",
+            "name": "payment_payee_identifier"
+          },
+          {
+            "type": "string",
+            "name": "payment_online_payment_identifier"
+          },
+          {
+            "type": "string",
+            "name": "funding_online_funding_identifier"
+          },
+          {
+            "type": "string",
+            "name": "defunding_online_defunding_identifier"
+          },
+          {
+            "type": "string",
+            "name": "funding_rtgs_business_date"
+          },
+          {
+            "type": "string",
+            "name": "defunding_rtgs_business_date"
+          },
+          {
+            "type": "double",
+            "name": "payment_payment_amount"
           }
-        ]
+        ],
+        "dimensionExclusions": [],
+        "includeAllDimensions": false,
+        "useSchemaDiscovery": false
       },
       "metricsSpec": [
-        {
-          "type": "doubleSum",
-          "name": "montant",
-          "fieldName": "montant"
-        },
         {
           "type": "count",
           "name": "count"
@@ -84,15 +177,11 @@
       ],
       "granularitySpec": {
         "type": "uniform",
-        "segmentGranularity": "HOUR",
-        "queryGranularity": "MINUTE",
-        "rollup": true,
+        "segmentGranularity": "DAY",
+        "queryGranularity": "NONE",
+        "rollup": false,
         "intervals": null
-      },
-      "transformSpec": {
-        "transforms": []
       }
     }
   }
 }
-

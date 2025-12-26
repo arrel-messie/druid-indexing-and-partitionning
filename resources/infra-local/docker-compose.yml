@@ -1,5 +1,4 @@
-# Volumes et réseaux sont définis dans le fichier principal (../docker-compose.yml)
-# Ce fichier peut être utilisé seul ou combiné avec le fichier principal
+# Infra file to simulate data ingestion  on druid to kafka
 volumes:
   metadata_data: {}
   middle_var: {}
